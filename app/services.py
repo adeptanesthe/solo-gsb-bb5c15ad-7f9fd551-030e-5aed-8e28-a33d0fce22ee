@@ -9,6 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from . import calibration as cal
+from . import condensation as cond
 from . import excursions as exc
 from . import incidents as inc
 from . import propagation as prop
@@ -20,6 +21,8 @@ from .schemas import (
     AnchorIn,
     CalibratedPointOut,
     CalibratedTimelineOut,
+    CondensationRiskOut,
+    CondensationWindowOut,
     ExcursionEventOut,
     ExcursionsOut,
     ExposureBudgetDimensionOut,
@@ -644,6 +647,64 @@ def build_case_exposure_budget(
                 exhausted_ts=d.exhausted_ts,
             )
             for d in result.dimensions
+        ],
+    )
+
+
+# ---------- 冷凝风险 ----------
+
+
+def build_case_condensation_risk(
+    db: Session,
+    device_sn: str,
+    start: dt.datetime | None,
+    end: dt.datetime | None,
+    surface_temperature_c: float,
+    margin_threshold_c: float,
+    max_gap_seconds: float,
+    min_duration_seconds: float,
+) -> CondensationRiskOut | None:
+    """Magnus 露点 + 冷凝裕量风险窗口（只读计算，不落库）。
+
+    设备没有任何读数时返回 ``None``（由上层判 404）；有读数但过滤后
+    为空范围时返回空窗口列表。湿度为 0 的读数计入 ``sample_count``
+    但不参与露点计算，并强制其两侧曲线断开。
+    """
+    all_samples = _load_samples(db, device_sn)
+    if not all_samples:
+        return None
+    samples = all_samples
+    if start is not None:
+        samples = [s for s in samples if s.ts >= start]
+    if end is not None:
+        samples = [s for s in samples if s.ts <= end]
+
+    windows = cond.compute_condensation_windows(
+        samples,
+        surface_temperature_c=surface_temperature_c,
+        margin_threshold_c=margin_threshold_c,
+        max_gap_seconds=max_gap_seconds,
+        min_duration_seconds=min_duration_seconds,
+    )
+    return CondensationRiskOut(
+        device_sn=device_sn,
+        start=start,
+        end=end,
+        surface_temperature_c=surface_temperature_c,
+        margin_threshold_c=margin_threshold_c,
+        max_gap_seconds=max_gap_seconds,
+        min_duration_seconds=min_duration_seconds,
+        sample_count=len(samples),
+        window_count=len(windows),
+        windows=[
+            CondensationWindowOut(
+                start_ts=w.start_ts,
+                end_ts=w.end_ts,
+                duration_seconds=w.duration_seconds,
+                min_margin=w.min_margin,
+                min_margin_ts=w.min_margin_ts,
+            )
+            for w in windows
         ],
     )
 

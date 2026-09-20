@@ -8,7 +8,9 @@
 预算**（exposure budget）耗尽时刻反解、基于各展柜非基线段首的**跨展柜
 共模突变**（common-mode incident）检测、基于已对齐锚点参考值的
 **分维偏移校正时间线**（只读），以及基于固定步长插值与正负时滞
-皮尔逊相关的**跨展柜环境传播分析**（propagation，只读）。
+皮尔逊相关的**跨展柜环境传播分析**（propagation，只读），以及基于
+Magnus 公式露点与表面温度冷凝裕量的**冷凝风险窗口**检测
+（condensation risk，只读）。
 
 ---
 
@@ -227,6 +229,35 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 任一展柜没有读数返回 `404`；两柜无重叠或全部时滞不可用时返回 `200` 与
 `direction=unavailable`。接口**只读**，不写库、不改版本号。
 
+### 11. 冷凝风险
+
+`GET /api/v1/cases/{sn}/condensation-risk` 用 **Magnus 公式**由空气温度 T
+与相对湿度 RH 逐点计算露点 Td，再以请求给定的**表面温度** Ts 计算
+冷凝裕量并检测风险窗口（只读，不写库、不改版本号）：
+
+```
+γ  = ln(RH/100) + 17.62·T/(243.12 + T)
+Td = 243.12·γ/(17.62 − γ)
+冷凝裕量 margin = Ts − Td
+```
+
+- 裕量越小越接近结露：`margin ≤ margin_threshold_c` 即风险（**含等于**）。
+- 裕量曲线定义在**相邻有效点之间的线段**上并按时间**线性插值**：进入与
+  离开风险阈值的时刻在跨越线段内精确反解，不做阶梯近似。
+- 相邻读数间隔**大于** `max_gap_seconds` 时曲线断开（恰好等于仍连续），
+  未知区间不计风险；**湿度为 0 的读数无效**（`ln(0)` 不定义），相邻线段
+  任一端点湿度为 0 时该线段必须断开。**断档两侧的窗口绝不合并**。
+- 仅返回持续时间 **≥** `min_duration_seconds`（含等于）的风险窗口；每个
+  窗口给出 `start_ts` / `end_ts`（精确阈值交点）、`duration_seconds`，
+  以及窗口内**最低裕量 `min_margin` 与其时刻 `min_margin_ts`**——裕量沿
+  线段线性，最低裕量必落在某个有效读数时刻（并列取最早）。
+
+`surface_temperature_c`（°C，−50…100）、`margin_threshold_c`（°C）为
+必填；`max_gap_seconds` 默认 `600`（必须 **> 0**）、
+`min_duration_seconds` 默认 `0`（必须 **≥ 0**）。`start` 晚于 `end`
+返回 `422`；展柜没有读数返回 `404`；过滤后为空范围返回 `200` 与空窗口
+列表（`sample_count` 含湿度为 0 的无效读数）。
+
 ---
 
 ## 接口一览
@@ -240,6 +271,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
 | GET  | `/api/v1/cases/{sn}/exposure-budget` | 累计越界剂量预算：窗末累计量、剩余额度与首次达到预算的精确时刻 |
 | GET  | `/api/v1/cases/{sn}/calibrated-timeline` | 锚点参考值校正的只读时间线：分维偏移线性插值，支持 `start` / `end` 过滤 |
+| GET  | `/api/v1/cases/{sn}/condensation-risk` | 冷凝风险：Magnus 露点 + 表面温度裕量，线性插值精确窗口、断档/零湿度断开 |
 | GET  | `/api/v1/incidents` | 跨展柜共模突变：非基线段首候选窗 + 全局最优互不重叠选择 |
 | GET  | `/api/v1/propagation` | 跨展柜环境传播：重叠时段固定步长插值 + 正负时滞皮尔逊相关（只读） |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
@@ -607,6 +639,61 @@ curl 'http://localhost:8080/api/v1/propagation?source_sn=CASE-A&target_sn=CASE-B
 两柜无重叠时所有档位的 `reason` 为 `no_overlap`，且
 `grid_point_count=0`、`direction="unavailable"`。
 
+### 冷凝风险查询
+
+```bash
+curl 'http://localhost:8080/api/v1/cases/CASE-007/condensation-risk?surface_temperature_c=10&margin_threshold_c=0&max_gap_seconds=600&min_duration_seconds=300&start=2026-09-01T00:00:00Z&end=2026-09-02T00:00:00Z'
+```
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `surface_temperature_c` | 是 | — | 给定的展柜表面温度（°C，−50…100）；冷凝裕量 = 表面温度 − 露点 |
+| `margin_threshold_c` | 是 | — | 冷凝裕量风险阈值（°C）：裕量 ≤ 该值视为风险（**含等于**） |
+| `start` / `end` | 否 | 不限 | 含端点的 ISO8601 过滤；只基于过滤后范围内的分段线性曲线 |
+| `max_gap_seconds` | 否 | `600` | 允许的最大采样间隔（秒，0 < x ≤ 86400）；超过则断开，未知区间不计风险 |
+| `min_duration_seconds` | 否 | `0` | 风险窗口最短持续（秒，**≥ 0**，含等于）；更短的窗口不返回 |
+
+露点由 Magnus 公式（`γ=ln(RH/100)+17.62T/(243.12+T)`，
+`Td=243.12γ/(17.62−γ)`）逐点计算；**湿度为 0 的读数无效**，其相邻
+线段强制断开。响应示例（空气温度 20→0→20°C、RH=100%，表面 10°C、
+阈值 0，风险发生在裕量 ≤ 0 的两段，交点恰为各段中点）：
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": null,
+  "end": null,
+  "surface_temperature_c": 10.0,
+  "margin_threshold_c": 0.0,
+  "max_gap_seconds": 600.0,
+  "min_duration_seconds": 300.0,
+  "sample_count": 3,
+  "window_count": 2,
+  "windows": [
+    {
+      "start_ts": "2026-09-01T00:00:00Z",
+      "end_ts": "2026-09-01T00:05:00Z",
+      "duration_seconds": 300.0,
+      "min_margin": -10.0,
+      "min_margin_ts": "2026-09-01T00:00:00Z"
+    },
+    {
+      "start_ts": "2026-09-01T00:15:00Z",
+      "end_ts": "2026-09-01T00:20:00Z",
+      "duration_seconds": 300.0,
+      "min_margin": -10.0,
+      "min_margin_ts": "2026-09-01T00:20:00Z"
+    }
+  ]
+}
+```
+
+`start_ts` / `end_ts` 为裕量曲线进入/离开阈值的**精确插值时刻**；
+`min_margin_ts` 必为某个有效读数时刻（裕量沿线段线性，并列取最早）。
+采样间隔超限或湿度为 0 的区间断开，断档两侧窗口不合并；缺少必填参数、
+`max_gap_seconds ≤ 0`、`min_duration_seconds < 0`、`start` 晚于 `end`
+均返回 `422`，展柜没有读数返回 `404`。
+
 ---
 
 ## 配置（环境变量）
@@ -652,4 +739,9 @@ start/end 过滤、无有效锚点偏移为 0、未对齐锚点忽略、只读�
 **跨展柜环境传播分析**（重叠时段固定步长网格与尾部不补点、相邻读数线性插值、
 `max_gap` 断档点无效与等于连续、正负时滞枚举与时滞符号约定、只数成对有效点、
 样本不足/常量序列标不可用且不产生 NaN、按 |r|→成对点数→|lag|→lag 择优、
-方向判定、无重叠 200 unavailable、422/404 参数校验、确定性）。
+方向判定、无重叠 200 unavailable、422/404 参数校验、确定性），以及
+**冷凝风险**（Magnus 露点表值与单调性、裕量线性插值的进入/离开交点
+精确性、阈值含等于、相接子区间合并与最低裕量（并列取最早）、`max_gap`
+断档与等于连续、湿度为 0 强制断开且不计入露点、`min_duration` 含等于
+过滤、断档两侧窗口不合并、参数校验 422、空范围 200、未知展柜 404、
+确定性）。

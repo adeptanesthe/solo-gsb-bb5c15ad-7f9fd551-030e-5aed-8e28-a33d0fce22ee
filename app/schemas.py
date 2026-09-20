@@ -362,6 +362,37 @@ class PropagationOut(BaseModel):
     )
 
 
+class CondensationWindowOut(BaseModel):
+    start_ts: dt.datetime = Field(..., description="风险窗口起点：裕量曲线进入阈值（margin = margin_threshold_c）的精确插值时刻")
+    end_ts: dt.datetime = Field(..., description="风险窗口终点：裕量曲线离开阈值的精确插值时刻")
+    duration_seconds: float = Field(..., description="窗口持续秒数（end_ts − start_ts）")
+    min_margin: float = Field(
+        ..., description="窗口内最低冷凝裕量（°C）；裕量沿线段线性，必落在某个有效读数时刻"
+    )
+    min_margin_ts: dt.datetime = Field(..., description="最低裕量对应的读数时刻（并列取最早）")
+
+
+class CondensationRiskOut(BaseModel):
+    device_sn: str
+    start: dt.datetime | None = Field(None, description="实际生效的起始过滤（UTC），未指定为 null")
+    end: dt.datetime | None = Field(None, description="实际生效的结束过滤（UTC），未指定为 null")
+    surface_temperature_c: float = Field(
+        ..., description="给定的展柜表面温度（°C），冷凝裕量 = 表面温度 − 露点"
+    )
+    margin_threshold_c: float = Field(
+        ..., description="冷凝裕量风险阈值（°C）：裕量 ≤ 该值视为风险（含等于）"
+    )
+    max_gap_seconds: float = Field(
+        ..., description="允许的最大相邻读数间隔（秒）；超过则曲线断开，未知区间不计风险"
+    )
+    min_duration_seconds: float = Field(
+        ..., description="风险窗口最短持续秒数（含等于）；更短的窗口不返回"
+    )
+    sample_count: int = Field(..., description="过滤后参与计算的读数数量（含湿度为 0 的无效读数）")
+    window_count: int
+    windows: list[CondensationWindowOut]
+
+
 class HealthOut(BaseModel):
     status: str
     db: str
