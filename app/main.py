@@ -19,6 +19,7 @@ from .schemas import (
     BatchIngest,
     CalibratedTimelineOut,
     CaseOut,
+    CondensationRiskOut,
     ExcursionsOut,
     ExposureBudgetOut,
     HealthOut,
@@ -58,9 +59,11 @@ app = FastAPI(
         "越界剂量（excursion dose）事件查询与分维累计剂量预算"
         "（exposure budget）耗尽时刻反解，以及基于已对齐锚点参考值的"
         "分维偏移校正时间线（只读）；并支持跨展柜共模突变检测与基于"
-        "固定步长插值、正负时滞皮尔逊相关的跨展柜环境传播分析（只读）。"
+        "固定步长插值、正负时滞皮尔逊相关的跨展柜环境传播分析（只读）；"
+        "以及基于 Magnus 公式露点与给定表面温度的冷凝裕量风险窗口查询"
+        "（线性插值阈值交点，只读）。"
     ),
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -374,6 +377,58 @@ def get_exposure_budget(
 
     out = services.build_case_exposure_budget(
         db, device_sn, start_utc, end_utc, thresholds, budgets, max_gap
+    )
+    if out is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
+    return out
+
+
+@app.get(
+    "/api/v1/cases/{device_sn}/condensation-risk",
+    response_model=CondensationRiskOut,
+    tags=["cases"],
+    summary="冷凝风险：Magnus 露点 + 冷凝裕量阈值线性插值 + 最短持续窗口",
+)
+def get_condensation_risk(
+    device_sn: str,
+    surface_temp_c: float = Query(
+        ..., ge=-50.0, le=100.0, description="展柜表面温度（°C）"
+    ),
+    margin_threshold_c: float = Query(
+        0.0,
+        ge=-50.0,
+        le=100.0,
+        description="冷凝裕量风险阈值（°C）：裕量 ≤ 该值视为风险",
+    ),
+    start: dt.datetime | None = Query(None, description="起始时间（含），ISO8601"),
+    end: dt.datetime | None = Query(None, description="结束时间（含），ISO8601"),
+    max_gap_seconds: float = Query(
+        600.0,
+        gt=0.0,
+        le=86400.0,
+        description="允许的最大采样间隔（秒）；超过则曲线断开，未知区间不产生窗口",
+    ),
+    min_duration_seconds: float = Query(
+        0.0,
+        ge=0.0,
+        description="风险窗口的最短持续秒数（≥ 0）；更短的窗口不返回",
+    ),
+    db: Session = Depends(get_db),
+):
+    start_utc = _parse_ts(start)
+    end_utc = _parse_ts(end)
+    if start_utc is not None and end_utc is not None and start_utc > end_utc:
+        raise HTTPException(status_code=422, detail="start 不能晚于 end")
+
+    out = services.build_case_condensation_risk(
+        db,
+        device_sn,
+        start_utc,
+        end_utc,
+        surface_temp_c=surface_temp_c,
+        margin_threshold_c=margin_threshold_c,
+        max_gap_seconds=max_gap_seconds,
+        min_duration_seconds=min_duration_seconds,
     )
     if out is None:
         raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")

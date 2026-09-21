@@ -262,6 +262,34 @@ class ExposureBudgetOut(BaseModel):
     )
 
 
+class CondensationRiskWindowOut(BaseModel):
+    start_ts: dt.datetime = Field(..., description="进入风险阈值的精确时刻（线性插值交点或读数时刻）")
+    end_ts: dt.datetime = Field(..., description="离开风险阈值的精确时刻（线性插值交点或读数时刻）")
+    duration_seconds: float = Field(..., description="窗口持续秒数")
+    min_margin_c: float = Field(
+        ..., description="窗口内最低冷凝裕量（°C，必为窗口内某读数的裕量；并列取最早）"
+    )
+    min_margin_ts: dt.datetime = Field(..., description="最低裕量出现的读数时刻")
+
+
+class CondensationRiskOut(BaseModel):
+    device_sn: str
+    start: dt.datetime | None = Field(None, description="实际生效的起始过滤（UTC），未指定为 null")
+    end: dt.datetime | None = Field(None, description="实际生效的结束过滤（UTC），未指定为 null")
+    surface_temp_c: float = Field(..., description="给定的表面温度（°C）")
+    margin_threshold_c: float = Field(
+        ..., description="冷凝裕量风险阈值（°C）：裕量 ≤ 该值视为风险"
+    )
+    max_gap_seconds: float = Field(..., description="生效的最大采样间隔（秒）")
+    min_duration_seconds: float = Field(..., description="生效的最短窗口持续（秒）")
+    sample_count: int = Field(..., description="过滤后参与计算的读数数量")
+    valid_sample_count: int = Field(
+        ..., description="其中湿度 > 0、可计算露点的读数数量（湿度为 0 的读数使曲线断开）"
+    )
+    window_count: int
+    windows: list[CondensationRiskWindowOut]
+
+
 IncidentDirection = Literal["up", "down", "flat"]
 
 

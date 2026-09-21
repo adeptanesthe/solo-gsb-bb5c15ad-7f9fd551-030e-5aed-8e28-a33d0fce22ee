@@ -8,7 +8,9 @@
 预算**（exposure budget）耗尽时刻反解、基于各展柜非基线段首的**跨展柜
 共模突变**（common-mode incident）检测、基于已对齐锚点参考值的
 **分维偏移校正时间线**（只读），以及基于固定步长插值与正负时滞
-皮尔逊相关的**跨展柜环境传播分析**（propagation，只读）。
+皮尔逊相关的**跨展柜环境传播分析**（propagation，只读），以及基于
+**Magnus 公式露点**与给定表面温度的**冷凝风险窗口**查询
+（condensation risk，只读）。
 
 ---
 
@@ -227,6 +229,33 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 任一展柜没有读数返回 `404`；两柜无重叠或全部时滞不可用时返回 `200` 与
 `direction=unavailable`。接口**只读**，不写库、不改版本号。
 
+### 11. 冷凝风险窗口
+
+`GET /api/v1/cases/{sn}/condensation-risk` 按 **Magnus 公式**由每条读数的
+温度、相对湿度逐点计算露点，再以**给定表面温度 − 露点**得到冷凝裕量曲线，
+裕量 **≤ `margin_threshold_c`**（含等于）的连续区间即为风险窗口：
+
+```
+γ  = ln(RH / 100) + 17.62·T / (243.12 + T)
+Td = 243.12·γ / (17.62 − γ)          （露点，°C）
+裕量 = surface_temp_c − Td            （°C）
+```
+
+- 进入与离开风险阈值的时刻按相邻有效读数间的裕量**线性插值精确求出**，
+  不做阶梯近似；窗口最低裕量必落在窗口内某个读数上（并列取最早）。
+- **湿度为 0** 的读数无法取对数、露点无定义：该点两侧区间一律**断开**；
+  相邻有效读数间隔**大于** `max_gap_seconds` 时曲线同样断开（恰好等于
+  仍视为连续），未知区间不产生窗口。
+- 窗口只在同一段连续曲线内相接时合并，**绝不跨断档合并**；孤立有效点
+  （两侧区间均断开）不构成区间，不产生窗口。
+- 只返回持续**至少** `min_duration_seconds` 的窗口（更短的剔除）；每个
+  窗口给出起止时间、持续秒数、最低裕量 `min_margin_c` 及其出现的读数
+  时刻 `min_margin_ts`，窗口按开始时间升序排列。
+
+`surface_temp_c` 必填；`start > end`、`max_gap_seconds ≤ 0`、
+`min_duration_seconds < 0` 均返回 `422`；展柜没有读数返回 `404`，
+过滤后为空范围返回 `200` 与空窗口列表。接口**只读**，不写库、不改版本号。
+
 ---
 
 ## 接口一览
@@ -240,6 +269,7 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 | GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
 | GET  | `/api/v1/cases/{sn}/exposure-budget` | 累计越界剂量预算：窗末累计量、剩余额度与首次达到预算的精确时刻 |
 | GET  | `/api/v1/cases/{sn}/calibrated-timeline` | 锚点参考值校正的只读时间线：分维偏移线性插值，支持 `start` / `end` 过滤 |
+| GET  | `/api/v1/cases/{sn}/condensation-risk` | 冷凝风险窗口：Magnus 露点 + 裕量阈值线性插值 + 最短持续过滤（只读） |
 | GET  | `/api/v1/incidents` | 跨展柜共模突变：非基线段首候选窗 + 全局最优互不重叠选择 |
 | GET  | `/api/v1/propagation` | 跨展柜环境传播：重叠时段固定步长插值 + 正负时滞皮尔逊相关（只读） |
 | POST | `/api/v1/anchors` | 登记/更新锚点并重放 |
@@ -607,6 +637,53 @@ curl 'http://localhost:8080/api/v1/propagation?source_sn=CASE-A&target_sn=CASE-B
 两柜无重叠时所有档位的 `reason` 为 `no_overlap`，且
 `grid_point_count=0`、`direction="unavailable"`。
 
+### 冷凝风险窗口查询
+
+```bash
+curl 'http://localhost:8080/api/v1/cases/CASE-007/condensation-risk?surface_temp_c=10&margin_threshold_c=0&max_gap_seconds=600&min_duration_seconds=0'
+```
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `surface_temp_c` | **必填** | 展柜表面温度（°C，−50…100）；冷凝裕量 = 表面温度 − 露点 |
+| `margin_threshold_c` | `0` | 冷凝裕量风险阈值（°C，−50…100）；裕量 ≤ 该值视为风险 |
+| `start` / `end` | 不限 | 含端点的 ISO8601 过滤；裕量曲线只基于过滤后范围内的读数 |
+| `max_gap_seconds` | `600` | 允许的最大采样间隔（秒，0 < x ≤ 86400）；超过则曲线断开 |
+| `min_duration_seconds` | `0` | 风险窗口的最短持续秒数（≥ 0）；更短的窗口不返回 |
+
+响应示例（湿度 100% 时露点等于温度；裕量 +2°C → −2°C 线性变化，
+恰在中点进入/离开风险阈值）：
+
+```json
+{
+  "device_sn": "CASE-007",
+  "start": null,
+  "end": null,
+  "surface_temp_c": 10.0,
+  "margin_threshold_c": 0.0,
+  "max_gap_seconds": 600.0,
+  "min_duration_seconds": 0.0,
+  "sample_count": 4,
+  "valid_sample_count": 4,
+  "window_count": 1,
+  "windows": [
+    {
+      "start_ts": "2026-09-01T00:05:00Z",
+      "end_ts": "2026-09-01T00:25:00Z",
+      "duration_seconds": 1200.0,
+      "min_margin_c": -2.0,
+      "min_margin_ts": "2026-09-01T00:10:00Z"
+    }
+  ]
+}
+```
+
+`sample_count` 为过滤后读数总数，`valid_sample_count` 为其中湿度 > 0、
+可计算露点的读数数量（湿度为 0 的读数使曲线断开、不参与插值）。
+窗口起止时间为线性插值得到的**精确阈值交点**（可落在读数之间）；
+`min_margin_c` / `min_margin_ts` 为窗口内最低裕量及其出现的读数时刻
+（并列取最早）。
+
 ---
 
 ## 配置（环境变量）
@@ -652,4 +729,9 @@ start/end 过滤、无有效锚点偏移为 0、未对齐锚点忽略、只读�
 **跨展柜环境传播分析**（重叠时段固定步长网格与尾部不补点、相邻读数线性插值、
 `max_gap` 断档点无效与等于连续、正负时滞枚举与时滞符号约定、只数成对有效点、
 样本不足/常量序列标不可用且不产生 NaN、按 |r|→成对点数→|lag|→lag 择优、
-方向判定、无重叠 200 unavailable、422/404 参数校验、确定性）。
+方向判定、无重叠 200 unavailable、422/404 参数校验、确定性），以及
+**冷凝风险窗口**（Magnus 露点参考值与饱和湿度露点等于温度、裕量线性插值
+精确进出阈值、等于阈值视为风险、最低裕量落在读数上且并列取最早、
+`max_gap` 断开与等于连续、湿度为 0 断档且窗口不跨断档合并、孤立有效点
+不产生窗口、零时长触及窗口、`min_duration_seconds` 过滤含等于、
+`surface_temp_c` 必填与 422/404/空范围、确定性、OpenAPI 含新路径）。
